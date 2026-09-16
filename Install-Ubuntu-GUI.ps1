@@ -49,12 +49,34 @@ function Info($msg) { Write-Host $msg -ForegroundColor Gray }
 function Ok($msg)   { Write-Host $msg -ForegroundColor Green }
 function Warn($msg) { Write-Host $msg -ForegroundColor Yellow }
 
-# wsl/bash reads stdin literally, so a PowerShell here-string's CRLF line
-# endings show up inside bash as trailing \r on every line (breaking `set -e`
-# and, critically, corrupting piped secrets like the chpasswd password).
-# Normalize to LF before ever piping a script into `bash -s`.
+# Getting a shell script from PowerShell into bash intact takes more care than
+# it looks. Two traps, both silent:
+#
+#   * CRLF. Normalizing the here-string is not enough: piping a string to a
+#     native command makes PowerShell append its own CRLF, so the LAST line of
+#     the script arrives with a trailing \r. That turned this script's
+#     `>> /etc/wsl.conf` into a write to `/etc/wsl.conf<CR>`, and made every
+#     script ending in `done` or `fi` die with a syntax error - while
+#     PowerShell still reported success.
+#
+#   * `wsl -- <cmd>` runs <cmd> through the distro's DEFAULT SHELL, which
+#     expands $vars and $(...) before the real target ever sees them.
+#     `--exec` passes argv straight through instead.
+#
+# So: write the script out as a real LF-only file and exec bash on it.
 function Invoke-WslBash($Script, $Distro = $DistroName, $User = "root") {
-    ($Script -replace "`r`n", "`n") | wsl -d $Distro -u $User -- bash -s
+    $tmp = Join-Path $env:TEMP ("ubuntu-gui-" + [guid]::NewGuid().ToString("N") + ".sh")
+    $body = ($Script -replace "`r`n", "`n" -replace "`r", "`n")
+    [IO.File]::WriteAllText($tmp, $body + "`n", (New-Object Text.UTF8Encoding($false)))
+    try {
+        $linuxPath = (& wsl -d $Distro --exec wslpath -a $tmp).Trim()
+        & wsl -d $Distro -u $User --exec bash $linuxPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "a configuration step failed inside $Distro (bash exit code $LASTEXITCODE)"
+        }
+    } finally {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
 }
 
 if (-not (Get-Command wsl -ErrorAction SilentlyContinue)) {
@@ -112,6 +134,11 @@ Step "3/6  Configuring wsl.conf (systemd) and default user"
 # ---------------------------------------------------------------------------
 $confScript = @'
 set -e
+
+# Clean up after the CRLF bug described above: it appended the [user] block to
+# a file literally named "wsl.conf<CR>" instead of wsl.conf.
+rm -f "$(printf '/etc/wsl.conf\r')"
+
 touch /etc/wsl.conf
 grep -q "^systemd=true" /etc/wsl.conf || printf "\n[boot]\nsystemd=true\n" >> /etc/wsl.conf
 grep -q "^default=" /etc/wsl.conf || printf "\n[user]\ndefault=root\n" >> /etc/wsl.conf
@@ -124,7 +151,7 @@ Ok "wsl.conf configured (systemd enabled so xrdp can autostart; default user pre
 $newPassword = "root"
 if ($isNewInstall) {
     Info "Setting the root password for the new install..."
-    wsl -d $DistroName -u root -- bash -c "echo 'root:$newPassword' | chpasswd"
+    Invoke-WslBash "echo 'root:$newPassword' | chpasswd"
     Ok "Default login for '$DistroName' -> user: root / password: $newPassword"
 }
 
@@ -137,11 +164,31 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 x11-xserver-utils
 
-# Dedicated port so it never collides with a native Windows RDP listener,
-# and bind to loopback only so it is never reachable off-box.
-sed -i "s/^port=.*/port=__PORT__/" /etc/xrdp/xrdp.ini
-sed -i '/^#\?address=/d' /etc/xrdp/xrdp.ini
-sed -i '0,/^\[globals\]/s//[globals]\naddress=127.0.0.1/' /etc/xrdp/xrdp.ini
+# Dedicated port so it never collides with a native Windows RDP listener.
+#
+# A bare "port=3390" tells xrdp to listen on all interfaces, which it does as
+# a single IPv6 (::) socket - and WSL2's localhost relay only forwards IPv4
+# bindings, so mstsc against 127.0.0.1 gets ECONNREFUSED forever while xrdp
+# looks perfectly healthy from inside the distro. xrdp's tcp://.:PORT URL form
+# binds IPv4 127.0.0.1 instead: reachable through the relay, and still never
+# exposed off-box. (xrdp has no "address=" key - see the commented examples in
+# xrdp.ini - so writing one was a no-op.)
+#
+# Only the [Globals] port is ours. The per-backend ports must keep their
+# packaged defaults ([Xorg]/[Xvnc] port=-1, ...); an unanchored sed in an
+# earlier version of this script overwrote them too, which breaks session
+# startup after login, so restore any that still hold our port number.
+awk -v PORT=__PORT__ '
+/^[ \t]*\[/ { section = tolower($0); sub(/[ \t\r]+$/, "", section) }
+section == "[globals]" && /^port=/            { print "port=tcp://.:" PORT; next }
+section == "[globals]" && /^address=/         { next }
+section == "[xorg]"    && $0 == "port=" PORT  { print "port=-1"; next }
+section == "[xvnc]"    && $0 == "port=" PORT  { print "port=-1"; next }
+section == "[vnc-any]" && $0 == "port=" PORT  { print "port=ask5900"; next }
+section == "[neutrinordp-any]" && $0 == "port=" PORT { print "port=ask3389"; next }
+{ print }
+' /etc/xrdp/xrdp.ini > /etc/xrdp/xrdp.ini.new
+mv /etc/xrdp/xrdp.ini.new /etc/xrdp/xrdp.ini
 
 # The default WSL login is root; make sure sesman will actually accept it
 # (some xrdp packages ship AllowRootLogin=false, which fails root logins
@@ -152,13 +199,45 @@ else
     sed -i '0,/^\[Security\]/s//[Security]\nAllowRootLogin=true/' /etc/xrdp/sesman.ini
 fi
 
-echo "xfce4-session" > /etc/skel/.xsession
+# The session script. WSLg exports WAYLAND_DISPLAY (and DISPLAY=:0) into every
+# process in the distro, so inside an xrdp session XFCE 4.20 picks its Wayland
+# backend and draws nothing at all: xfdesktop bails out with "your compositor
+# must support the zwlr_layer_shell_v1 protocol" and the client just shows a
+# black screen. Pin the session to X11 on the display xrdp handed us.
+cat > /etc/skel/.xsession <<'XSESSION'
+#!/bin/sh
+unset WAYLAND_DISPLAY WAYLAND_SOCKET
+export XDG_SESSION_TYPE=x11
+export GDK_BACKEND=x11
+export QT_QPA_PLATFORM=xcb
+exec xfce4-session
+XSESSION
+chmod +x /etc/skel/.xsession
+
 for home in /root /home/*; do
-    if [ -d "$home" ]; then echo "xfce4-session" > "$home/.xsession"; fi
+    if [ -d "$home" ]; then
+        install -m 755 -o "$(stat -c %U "$home")" -g "$(stat -c %G "$home")" \
+            /etc/skel/.xsession "$home/.xsession"
+    fi
 done
 
 adduser xrdp ssl-cert || true
-systemctl enable xrdp >/dev/null 2>&1 || true
+
+# Bring it up now as well as on every boot, then prove it is really listening
+# on the loopback address Windows can reach. Swallowing a failure here is what
+# leaves the launcher spinning on "Waiting for the desktop session..." later.
+systemctl enable xrdp
+systemctl restart xrdp
+for _ in $(seq 1 20); do
+    ss -ltn | grep -q "127.0.0.1:__PORT__" && break
+    sleep 1
+done
+if ! ss -ltn | grep -q "127.0.0.1:__PORT__"; then
+    echo "ERROR: xrdp did not start listening on 127.0.0.1:__PORT__" >&2
+    systemctl --no-pager -l status xrdp >&2 || true
+    exit 1
+fi
+echo "xrdp is listening on 127.0.0.1:__PORT__"
 '@
 $guiScript = $guiScript.Replace("__PORT__", $RdpPort)
 Invoke-WslBash $guiScript
@@ -168,7 +247,7 @@ Ok "XFCE4 desktop + xrdp installed, listening on 127.0.0.1:$RdpPort."
 Step "5/6  Wiring up the shared folder"
 # ---------------------------------------------------------------------------
 New-Item -ItemType Directory -Path $SharedDir -Force | Out-Null
-$wslSharedPath = (wsl -d $DistroName -- wslpath -a "$SharedDir").Trim()
+$wslSharedPath = (& wsl -d $DistroName --exec wslpath -a "$SharedDir").Trim()
 
 $shareScript = @'
 set -e
@@ -178,6 +257,9 @@ for home in /root /home/*; do
         ln -sfn "__SHARE__" "$home/Documents/shared"
     fi
 done
+
+# This step used to fail silently; make a broken link loud instead.
+test -d /root/Documents/shared
 '@
 $shareScript = $shareScript.Replace("__SHARE__", $wslSharedPath)
 Invoke-WslBash $shareScript

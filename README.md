@@ -181,17 +181,27 @@ Every step in `Install-Ubuntu-GUI.ps1` is written to be safe to re-run:
 This means the same script doubles as a repair tool: if xrdp stops working
 after a package update, just run `Install-Ubuntu-GUI.ps1` again.
 
-### CRLF-safety of embedded bash
+### Getting bash scripts into WSL intact
 
 The install script builds several small bash scripts as PowerShell
-here-strings and pipes them into `wsl ... -- bash -s`. PowerShell
-here-strings use Windows (`CRLF`) line endings by default, which would
-otherwise arrive inside bash as trailing `\r` characters on every line —
-breaking `set -e` and, critically, corrupting anything piped through
-stdin (such as a password piped to `chpasswd`). The installer normalizes
-every such script to `\n` line endings before sending it (`Invoke-WslBash`
-helper), and sets the root password via a `bash -c` argument instead of
-stdin entirely, so it's not exposed to that class of bug at all.
+here-strings. Handing those to WSL correctly takes more care than it looks,
+because both failure modes are silent:
+
+- **Trailing `CR`.** Normalizing a here-string to `\n` is not enough: piping a
+  string to a native command makes PowerShell append its *own* `CRLF`, so the
+  last line of the script arrives in bash with a trailing `\r`. That is enough
+  to turn `>> /etc/wsl.conf` into a write to a file literally named
+  `wsl.conf<CR>`, and to make any script ending in `done` or `fi` die with a
+  syntax error — while PowerShell still reports success.
+- **`wsl -- <cmd>` uses the default shell.** Everything after `--` is run
+  *through the distro's login shell*, which expands `$vars` and `$(...)`
+  before the real target ever sees them. `wsl --exec <cmd>` passes argv
+  through untouched.
+
+So `Invoke-WslBash` writes each script out as a real LF-only file and runs
+`wsl --exec bash <file>` on it, and every other in-distro call in both scripts
+uses `--exec`. `Invoke-WslBash` also throws if bash exits non-zero, so a failed
+configuration step can no longer be reported as a success.
 
 ---
 
@@ -200,7 +210,9 @@ stdin entirely, so it's not exposed to that class of bug at all.
 | Symptom | Likely cause / fix |
 |---|---|
 | Install script says a reboot is needed | WSL2/VMP features were just enabled and need one restart. Reboot, then re-run the script. |
-| `Open Ubuntu GUI.bat` times out waiting for xrdp | Re-run `Install-Ubuntu-GUI.ps1` to repair the desktop/xrdp install. |
+| `Open Ubuntu GUI.bat` times out waiting for xrdp | Check where xrdp is listening (`ss -ltn` as root inside Ubuntu). It must be `127.0.0.1:3390`, **not** `*:3390` — WSL only forwards IPv4 bindings to the Windows `localhost` address, so an all-interfaces (IPv6 `::`) listener is invisible from Windows. `Install-Ubuntu-GUI.ps1` sets `port=tcp://.:3390` to force the IPv4 loopback bind; re-run it to repair. The launcher prints this diagnostic itself on timeout. |
+| RDP connects, then "cannot connect to the remote computer" | The WSL instance shut down under the session. WSL stops a distro ~15s after the last `wsl.exe` client exits (systemd inside does not prevent this), so `Ubuntu-GUI.ps1 -Action Open` holds a hidden `wsl --exec sleep infinity` session open for the lifetime of the desktop. `-Action Close` ends it. |
+| Desktop is a black screen after login | XFCE picked its Wayland backend: WSLg exports `WAYLAND_DISPLAY` into every process in the distro, and `xfdesktop` then refuses to draw ("your compositor must support the zwlr_layer_shell_v1 protocol"). `~/.xsession` must unset `WAYLAND_DISPLAY` and pin `GDK_BACKEND=x11` before exec'ing `xfce4-session`; re-run `Install-Ubuntu-GUI.ps1` to rewrite it. |
 | Login rejected in the RDP window | Check `credentials.md`; if you changed the password with `passwd`, use the new one. |
 | Session window has scrollbars / doesn't fill the window | Update `xrdp` (`apt-get upgrade xrdp` as root inside Ubuntu) — older builds may not support the dynamic-resolution channel; `smart sizing` should still cover this case. |
 | Shared folder empty on one side | Make sure the WSL instance is running (`Open Ubuntu GUI.bat`); the link is live only while WSL2 is up. |
