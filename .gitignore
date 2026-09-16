@@ -1,0 +1,10 @@
+# Generated on install - contains a real login password, never commit it
+credentials.md
+
+# Live Windows<->Ubuntu shared-folder contents are user data, not project files
+shared/*
+!shared/.gitkeep
+
+# Runtime scratch files
+*.rdp
+_tmp/
